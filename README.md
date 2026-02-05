@@ -1,1 +1,1 @@
-# project26s2
+# 2026 Semi - Project #2 News Keyword Visualizer
