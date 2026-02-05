@@ -1,32 +1,31 @@
+# app_v3_timeout_fixed.py
 #
 # ===================================================
-# News Keyword Visualizer V3
+# News Keyword Visualizer V3 (Timeout Hardened)
 # ---------------------------------------------------
-#
-# - 역할별 함수 분리 
-#   (API / 크롤링 / 전처리 / 분석 / 시각화 / 다운로드 / UI)
-#
-# - 예외 상황 방어 강화 (앱이 죽지 않도록 처리)
-#   * API 인증 실패 처리(401/403 등)
-#   * 네트워크 오류 처리(timeout, connection error 등)
-#   * 크롤링 실패 시 skip 처리
-#   * 데이터 부족 시 사용자 안내 강화
-#    if res.status_code != 200: st.error("API 요청 실패")
-#
+# ✅ 타임아웃 문제 완화 추가
+#  - requests.Session + 연결 재사용(속도/안정성↑)
+#  - Retry + Exponential Backoff(+Jitter)
+#  - API/Crawl 타임아웃 분리
+#  - 본문 크롤링 제한 병렬(ThreadPool)로 총 소요시간 단축
 # ===================================================
-#
 
 import json
 import re
 import pickle
 import html
+import time
+import random
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from io import BytesIO
 from urllib.parse import quote
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests as rq
+from requests.adapters import HTTPAdapter
+
 import bs4
 import pandas as pd
 import numpy as np
@@ -48,7 +47,6 @@ from soynlp.noun import LRNounExtractor_v2
 FONT_PATH = "./resources/NanumSquareR.ttf"
 STOPWORDS_PATH = "./resources/stopwords_ko.txt"
 TOKENIZER_PATH = "./resources/my_tokenizer1.model"
-
 LOTTIE_PATH = "./resources/lottie-full-movie-experience-including-music-news-video-weather-and-lots-of-entertainment.json"
 
 MASK_BG = {
@@ -57,6 +55,17 @@ MASK_BG = {
     "말풍선": "./resources/background_2.png",
     "하트": "./resources/background_3.png",
 }
+
+# ===================================================
+# ✅ 타임아웃/재시도/병렬 설정 (핵심!)
+# ===================================================
+TIMEOUT_API = 6          # API는 짧게 (배포환경에서 너무 길게 잡으면 전체 지연)
+TIMEOUT_CRAWL = 8        # 본문 크롤링은 조금 더 여유
+MAX_RETRIES = 3          # 재시도 횟수
+BACKOFF_BASE = 0.8       # 백오프 기본(초) - 0.8, 1.6, 3.2 ... + jitter
+MAX_WORKERS = 6          # 크롤링 병렬 수(너무 높이면 차단/불안정)
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
 
 def setup_matplotlib_korean_font() -> None:
@@ -70,6 +79,68 @@ def setup_matplotlib_korean_font() -> None:
     except Exception:
         plt.rcParams["font.family"] = "Malgun Gothic"
     plt.rcParams["axes.unicode_minus"] = False
+
+
+# ===================================================
+# ✅ (추가) requests 세션 생성: 연결 재사용 + 기본 retry(연결 레벨)
+# ===================================================
+@st.cache_resource
+def create_http_session() -> rq.Session:
+    """
+    Streamlit Cloud에서는 네트워크 변동/연결 불안정이 종종 있습니다.
+    Session + HTTPAdapter로 연결 재사용 + 기본 재시도(연결단)를 설정해 안정성을 올립니다.
+
+    ※ 여기서는 urllib3 Retry를 직접 쓰지 않고,
+      아래 request_with_retry()에서 앱 레벨 재시도를 수행합니다.
+      (배포환경에서 제어/로그가 더 쉬움)
+    """
+    s = rq.Session()
+    adapter = HTTPAdapter(
+        pool_connections=20,
+        pool_maxsize=20,
+        max_retries=0,  # 앱 레벨에서 재시도하므로 여기서는 0
+    )
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+
+# ===================================================
+# ✅ (추가) 재시도 + 백오프(+jitter) 요청 래퍼
+# ===================================================
+def request_with_retry(
+    session: rq.Session,
+    method: str,
+    url: str,
+    *,
+    headers: dict | None = None,
+    timeout: int = 10,
+    max_retries: int = MAX_RETRIES,
+) -> rq.Response | None:
+    """
+    타임아웃/일시 네트워크 오류를 만나도 곧바로 실패하지 않고 재시도합니다.
+
+    - Exponential Backoff: BACKOFF_BASE * (2 ** attempt)
+    - Jitter: 랜덤(0~0.3초) 추가 → 배포 환경에서 동시 재시도 충돌 완화
+    """
+    last_exc = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            res = session.request(method, url, headers=headers, timeout=timeout)
+            return res
+        except (rq.exceptions.Timeout, rq.exceptions.ConnectionError, rq.exceptions.RequestException) as e:
+            last_exc = e
+
+            # 마지막 시도면 종료
+            if attempt == max_retries:
+                break
+
+            sleep_sec = (BACKOFF_BASE * (2 ** attempt)) + random.uniform(0, 0.3)
+            time.sleep(sleep_sec)
+
+    # 실패 시 None 반환(상위에서 사용자 안내/skip 처리)
+    return None
 
 
 # ===================================================
@@ -151,20 +222,14 @@ def normalize_token(t: str) -> str:
 
 
 def build_final_keyword(category: str, user_keyword: str) -> str:
-    """
-    분야 + 사용자 키워드를 결합합니다.
-    - 공백을 1개로 정리
-    - 검색 안정성을 위해 '분야 + 공백 + 키워드' 형태를 사용
-    """
+    """분야 + 사용자 키워드 결합"""
     category = (category or "").strip()
     user_keyword = re.sub(r"\s+", " ", (user_keyword or "")).strip()
     return f"{category} {user_keyword}".strip()
 
 
 def safe_filename(s: str) -> str:
-    """
-    파일명에 들어가면 위험한 문자들을 '_'로 치환합니다.
-    """
+    """파일명 안전화"""
     s = s.strip()
     s = re.sub(r"[^\w\-가-힣]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
@@ -172,13 +237,13 @@ def safe_filename(s: str) -> str:
 
 
 # ===================================================
-# 3) 네이버 API 통신(방어 코드 포함)
+# 3) 네이버 API 통신(타임아웃 강화)
 # ===================================================
 def naver_news_api_request(keyword: str, display: int, start: int, client_id: str, client_secret: str):
     """
     네이버 뉴스 검색 API 호출.
-    - 인증 실패/네트워크 오류/HTTP 오류를 처리해서 앱이 죽지 않게 함
-    - 실패 시 빈 리스트 반환
+    - request_with_retry 적용
+    - 실패 시 빈 리스트
     """
     if not client_id.strip() or not client_secret.strip():
         st.error("API 인증 정보(Client ID/Secret)가 비어 있습니다.")
@@ -188,24 +253,18 @@ def naver_news_api_request(keyword: str, display: int, start: int, client_id: st
     headers = {
         "X-Naver-Client-Id": client_id.strip(),
         "X-Naver-Client-Secret": client_secret.strip(),
+        "User-Agent": USER_AGENT,
     }
 
-    try:
-        res = rq.get(url, headers=headers, timeout=10)
-    except rq.exceptions.Timeout:
-        st.error("네트워크 오류: 요청 시간이 초과되었습니다(timeout).")
-        return []
-    except rq.exceptions.ConnectionError:
-        st.error("네트워크 오류: 서버에 연결할 수 없습니다(ConnectionError).")
-        return []
-    except rq.exceptions.RequestException as e:
-        st.error(f"네트워크 오류: {e}")
+    session = create_http_session()
+    res = request_with_retry(session, "GET", url, headers=headers, timeout=TIMEOUT_API)
+
+    if res is None:
+        st.error("네트워크 오류: 요청 시간이 초과되었거나 연결에 실패했습니다(timeout/connection).")
         return []
 
-    # ✅ 요구사항 반영: 상태코드가 200이 아니면 안내
     if res.status_code != 200:
-        st.error("API 요청 실패")  # 요구사항 문구
-        # 인증 관련이면 더 친절하게
+        st.error("API 요청 실패")
         if res.status_code in (401, 403):
             st.warning("API 인증 실패(권한/키 오류). Client ID/Secret을 확인하세요.")
         else:
@@ -221,27 +280,24 @@ def naver_news_api_request(keyword: str, display: int, start: int, client_id: st
 
 
 def fetch_news_items(final_keyword: str, total_display: int, client_id: str, client_secret: str) -> list[dict]:
-    """
-    total_display(100~500)를 100단위로 나누어 여러 번 요청 후 items를 합칩니다.
-    - 일부 페이지 실패해도 다른 페이지는 계속 진행하도록 설계
-    """
+    """100단위로 요청 후 합치기(부분 실패 허용)"""
     items: list[dict] = []
     page_count = max(1, total_display // 100)
 
     for i in range(page_count):
         start = 100 * i + 1
-        page_items = naver_news_api_request(final_keyword, display=100, start=start,
-                                            client_id=client_id, client_secret=client_secret)
+        page_items = naver_news_api_request(final_keyword, 100, start, client_id, client_secret)
         if page_items:
             items.extend(page_items)
+
+        # ✅ 페이지마다 아주 짧게 쉬어주면(특히 배포 환경) 실패율이 줄어듭니다.
+        time.sleep(0.15)
 
     return items
 
 
 def build_items_dataframe(items: list[dict]) -> pd.DataFrame:
-    """
-    items에서 title/pubDate/link만 추출하여 DataFrame 구성.
-    """
+    """items에서 title/pubDate/link만 추출"""
     rows = []
     for it in items:
         rows.append({
@@ -253,47 +309,69 @@ def build_items_dataframe(items: list[dict]) -> pd.DataFrame:
 
 
 # ===================================================
-# 4) 크롤링(실패 시 skip)
+# 4) 크롤링(타임아웃 강화 + 제한 병렬)
 # ===================================================
 def crawl_naver_news_body(url: str) -> str:
     """
-    네이버 뉴스 본문(#dic_area)을 크롤링합니다.
-    - 실패하면 "" 반환(=skip)
+    네이버 뉴스 본문(#dic_area) 크롤링
+    - request_with_retry 적용
+    - 실패 시 "" 반환(=skip)
     """
+    session = create_http_session()
+    headers = {"User-Agent": USER_AGENT}
+
+    res = request_with_retry(session, "GET", url, headers=headers, timeout=TIMEOUT_CRAWL)
+
+    if res is None:
+        return ""
+
+    if res.status_code != 200:
+        return ""
+
     try:
-        res = rq.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        if res.status_code != 200:
-            return ""
         soup = bs4.BeautifulSoup(res.text, "html.parser")
         tag = soup.select_one("#dic_area")
         return tag.get_text(separator=" ", strip=True) if tag else ""
-    except rq.exceptions.RequestException:
-        return ""
     except Exception:
         return ""
 
 
 def collect_corpus_from_items(items: list[dict]) -> list[str]:
     """
-    items 중 네이버 뉴스 링크만 대상으로 본문을 수집합니다.
-    - 크롤링 실패는 skip
-    - 너무 짧은 본문도 skip
+    ✅ 개선 포인트
+    - 크롤링을 '제한된 병렬'로 수행 → 전체 소요시간 감소 → 체감 timeout 감소
+    - 실패/짧은 본문은 skip
     """
-    docs = []
+    links = []
     for it in items:
         link = it.get("link", "")
-        if "n.news.naver" not in link:
-            continue
+        if "n.news.naver" in link:
+            links.append(link)
 
-        body = crawl_naver_news_body(link)
-        if not body:
-            continue
+    if not links:
+        return []
 
-        cleaned = clean_text_keep_korean(body)
-        if len(cleaned) < 100:
-            continue
+    docs: list[str] = []
 
-        docs.append(cleaned)
+    # ThreadPool로 병렬 크롤링(동시 요청 수는 MAX_WORKERS로 제한)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(crawl_naver_news_body, url): url for url in links}
+
+        for fut in as_completed(futures):
+            body = ""
+            try:
+                body = fut.result()
+            except Exception:
+                body = ""
+
+            if not body:
+                continue
+
+            cleaned = clean_text_keep_korean(body)
+            if len(cleaned) < 100:
+                continue
+
+            docs.append(cleaned)
 
     return docs
 
@@ -303,10 +381,7 @@ def collect_corpus_from_items(items: list[dict]) -> list[str]:
 # ===================================================
 @st.cache_data(show_spinner=False)
 def build_noun_set(docs_clean: list[str]) -> set[str]:
-    """
-    soynlp로 명사 후보를 학습/추출하여 set으로 반환.
-    - 데이터가 적으면 빈 set을 반환(=명사 필터 약화)
-    """
+    """soynlp 명사 후보 set"""
     sents = []
     for d in docs_clean:
         sents.extend([s.strip() for s in re.split(r"[\.!?]\s*|\n", d) if len(s.strip()) >= 10])
@@ -326,7 +401,6 @@ def build_noun_set(docs_clean: list[str]) -> set[str]:
         freq = getattr(score, "frequency", None)
         sc = getattr(score, "score", None)
 
-        # 버전/구조 방어
         if freq is None and isinstance(score, dict):
             freq = score.get("frequency")
         if sc is None and isinstance(score, dict):
@@ -342,14 +416,9 @@ def build_noun_set(docs_clean: list[str]) -> set[str]:
 
 
 def tokenize_and_filter_docs(docs_clean: list[str], stopwords: set[str]) -> list[list[str]]:
-    """
-    - 토크나이저로 토큰화
-    - soynlp noun_set 기반으로 명사만 남김
-    - 불용어 제거
-    """
+    """토큰화 + 명사 필터 + 불용어 제거"""
     tokenizer = load_tokenizer()
     if tokenizer is None:
-        # 토크나이저 로드 실패면 앱이 죽지 않도록 "공백 split"으로 fallback
         st.warning("토크나이저 로드 실패로 인해 간단한 split 토큰화를 사용합니다.")
         noun_set = set()
         return [
@@ -363,7 +432,6 @@ def tokenize_and_filter_docs(docs_clean: list[str], stopwords: set[str]) -> list
 
     docs_tokens = []
     for d in docs_clean:
-        # flatten=False → (left_token, right_token) 튜플 리스트
         try:
             toks = [t1 for t1, _ in tokenizer.tokenize(d, flatten=False)]
         except Exception:
@@ -388,10 +456,7 @@ def tokenize_and_filter_docs(docs_clean: list[str], stopwords: set[str]) -> list
 
 
 def compute_tfidf_scores(docs_tokens: list[list[str]], top_k: int = 80) -> dict[str, float]:
-    """
-    TF-IDF로 키워드 점수를 계산합니다.
-    - 데이터가 부족하면 빈 dict 반환
-    """
+    """TF-IDF 점수 계산"""
     docs_str = [" ".join(ts) for ts in docs_tokens if ts]
     if len(docs_str) < 2:
         return {}
@@ -413,17 +478,13 @@ def compute_tfidf_scores(docs_tokens: list[list[str]], top_k: int = 80) -> dict[
         idx = np.argsort(scores)[::-1][:top_k]
         return {terms[i]: float(scores[i]) for i in idx}
     except ValueError:
-        # min_df=2 조건 등으로 단어가 하나도 안 남는 경우
         return {}
     except Exception as e:
         st.error(f"TF-IDF 계산 중 오류: {e}")
         return {}
 
 
-def build_keyword_tables(score_dict: dict[str, float]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    score_dict를 DataFrame으로 변환하고 Top50/Top20을 함께 반환합니다.
-    """
+def build_keyword_tables(score_dict: dict[str, float]):
     df_kw = (
         pd.DataFrame(list(score_dict.items()), columns=["keyword", "score"])
         .sort_values("score", ascending=False)
@@ -435,10 +496,6 @@ def build_keyword_tables(score_dict: dict[str, float]) -> tuple[pd.DataFrame, pd
 # 6) 시각화(figure 반환)
 # ===================================================
 def make_wordcloud_figure(freq: dict[str, float], mask_name: str):
-    """
-    워드클라우드 figure를 생성해 반환합니다.
-    - freq가 비어있으면 None
-    """
     if not freq:
         return None
 
@@ -463,9 +520,6 @@ def make_wordcloud_figure(freq: dict[str, float], mask_name: str):
 
 
 def make_top20_bar_figure(df_top20: pd.DataFrame):
-    """
-    Top20 막대차트 figure를 생성해 반환합니다.
-    """
     if df_top20.empty:
         return None
 
@@ -488,9 +542,6 @@ def fig_to_png_bytes(fig) -> bytes:
 
 
 def make_images_zip_bytes(wc_fig, top20_fig, base_name: str) -> bytes:
-    """
-    버튼 1개로 워드클라우드 + Top20 차트 이미지를 함께 내려받기 위해 ZIP으로 묶습니다.
-    """
     zip_buf = BytesIO()
     with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{base_name}_wordcloud.png", fig_to_png_bytes(wc_fig))
@@ -503,7 +554,6 @@ def make_images_zip_bytes(wc_fig, top20_fig, base_name: str) -> bytes:
 # 8) UI 렌더링 함수들
 # ===================================================
 def render_header_with_lottie():
-    """타이틀 옆 Lottie + 타이틀 출력"""
     col1, col2 = st.columns([1, 2])
     with col1:
         lottie = load_json(LOTTIE_PATH)
@@ -517,7 +567,6 @@ def render_header_with_lottie():
 
 
 def render_sidebar_api_settings():
-    """사이드바 API 설정 입력 UI"""
     st.session_state.setdefault("client_id", "")
     st.session_state.setdefault("client_secret", "")
 
@@ -532,10 +581,6 @@ def render_sidebar_api_settings():
 
 
 def render_sidebar_stopwords() -> set[str]:
-    """
-    사이드바 불용어 입력 UI
-    - 파일 불용어 + 사용자 추가 불용어 합쳐서 반환
-    """
     st.sidebar.header("불용어(Stopwords)")
     base_stop = load_stopwords_file(STOPWORDS_PATH)
     extra_stop = st.sidebar.text_area("추가 불용어(줄바꿈으로 입력)", value="", height=120)
@@ -546,17 +591,12 @@ def render_sidebar_stopwords() -> set[str]:
 
 
 def render_main_form():
-    """
-    메인 입력 폼 UI
-    - 체크박스 배치 요구사항 반영
-    """
     with st.form("search", clear_on_submit=False):
         category = st.selectbox("분야:", ["경제", "정치", "사회", "국제", "연예", "IT", "문화"])
         user_keyword = st.text_input("검색 키워드(필수):", value="", placeholder="예: 금리, 반도체, AI, 메타버스 ...")
         display = st.select_slider("분량(기사 수):", options=[100, 200, 300, 400, 500], value=100)
         mask = st.radio("백마스크:", ["없음", "타원", "말풍선", "하트"], horizontal=True)
 
-        # 1줄: 기사 목록 보기, 링크 제공, 기사 목록 다운로드(.csv)
         r1c1, r1c2, r1c3 = st.columns([1, 1, 1])
         with r1c1:
             show_articles = st.checkbox("기사 목록 보기", value=True)
@@ -565,7 +605,6 @@ def render_main_form():
         with r1c3:
             dl_articles = st.checkbox("기사 목록 다운로드(.csv)", value=False)
 
-        # 2줄: 키워드 표 보기, 키워드 표 다운로드(.csv), 이미지 다운로드(.png)
         r2c1, r2c2, r2c3 = st.columns([1, 1, 1])
         with r2c1:
             show_keywords = st.checkbox("키워드 표 보기", value=True)
@@ -592,24 +631,20 @@ def render_main_form():
 
 
 # ===================================================
-# 9) 메인 실행 로직(앱의 흐름)
+# 9) 메인 실행 로직
 # ===================================================
 def run_app():
-    # 1) UI 기본
     st.set_page_config(page_title="뉴스 키워드 시각화", layout="wide")
     setup_matplotlib_korean_font()
     render_header_with_lottie()
 
-    # 2) Sidebar
     render_sidebar_api_settings()
     stopwords = render_sidebar_stopwords()
 
-    # 3) Form
     form = render_main_form()
     if not form["submitted"]:
         return
 
-    # 4) 입력 검증(데이터 부족 안내 강화)
     if not form["user_keyword"].strip():
         st.warning("검색 키워드를 입력해 주세요. (예: 금리, 반도체, AI)")
         return
@@ -623,7 +658,6 @@ def run_app():
 
     final_keyword = build_final_keyword(form["category"], form["user_keyword"])
 
-    # 5) 뉴스 목록 수집 (API 오류/인증 실패 방어)
     st.info(f"뉴스 목록 수집 중... (검색어: {final_keyword})")
     items = fetch_news_items(final_keyword, form["display"], client_id, client_secret)
 
@@ -634,7 +668,6 @@ def run_app():
 
     df_items = build_items_dataframe(items)
 
-    # 6) 기사 목록 표시/링크
     if form["show_articles"]:
         st.subheader("수집된 기사 목록")
         if df_items.empty:
@@ -644,12 +677,10 @@ def run_app():
 
             if form["show_links"]:
                 st.caption("기사 링크(클릭):")
-                # 너무 많으면 부담이 될 수 있어 상위 30개만
                 for _, r in df_items.head(30).iterrows():
                     if r["link"]:
                         st.markdown(f"- [🔗 바로가기]({r['link']}) — {r['title']}")
 
-    # 7) 본문 크롤링 (실패 시 skip)
     st.info("뉴스 본문 크롤링 중...")
     docs_clean = collect_corpus_from_items(items)
 
@@ -659,11 +690,10 @@ def run_app():
             "개선 팁:\n"
             "- 분량을 200~500으로 늘려보세요.\n"
             "- 키워드를 더 넓게/일반적으로 바꿔보세요.\n"
-            "- 링크 제공을 켜서 실제로 네이버 뉴스 링크가 많은지 확인해보세요."
+            "- 링크 제공을 켜서 네이버 뉴스 링크가 충분한지 확인해보세요."
         )
         return
 
-    # 8) 토큰화/필터 + TF-IDF
     st.info("키워드 분석 중(명사 필터 + TF-IDF)...")
     docs_tokens = tokenize_and_filter_docs(docs_clean, stopwords)
 
@@ -679,12 +709,10 @@ def run_app():
 
     df_kw, df_kw_top50, df_kw_top20 = build_keyword_tables(score_dict)
 
-    # 9) 키워드 표 표시
     if form["show_keywords"]:
         st.subheader("키워드(TF-IDF) 상위 50")
         st.dataframe(df_kw_top50, use_container_width=True)
 
-    # 10) 시각화
     st.info("워드클라우드 생성 중...")
     wc_fig = make_wordcloud_figure(score_dict, form["mask"])
     if wc_fig is None:
@@ -699,7 +727,6 @@ def run_app():
         return
     st.pyplot(top20_fig)
 
-    # 11) 다운로드(차트 아래, 버튼 한 줄 배치)
     st.markdown("---")
     st.subheader("결과 다운로드")
 
@@ -731,7 +758,6 @@ def run_app():
         )
 
     with c3:
-        # 버튼 문구는 .png로 보이지만 2장 동시 다운로드를 위해 ZIP 제공(안정적)
         zip_bytes = make_images_zip_bytes(wc_fig, top20_fig, f"{base}_{ts}") if can_images else b""
         st.download_button(
             label="이미지 다운로드(.png)",
@@ -742,8 +768,5 @@ def run_app():
         )
 
 
-# ===================================================
-# 엔트리포인트
-# ===================================================
 if __name__ == "__main__":
     run_app()
