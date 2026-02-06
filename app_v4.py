@@ -1,17 +1,40 @@
 #
 # ============================================================
-#  News Keyword Visualizer V4 (Diagnostics Enhanced)
+#  News Keyword Visualizer V4
 # ------------------------------------------------------------
-#  ✅ V4 기능 유지 + 배포 환경 진단 UI 추가
+#  ✅ V3 기능은 유지하면서 UI만 고도화한 버전
+#     (UI Improved + Safe Guards)
 #
-#  [추가된 진단 기능]
-#  - API 단계(페이지 단위) 성공/실패, 상태코드, timeout, 평균 응답시간 표시
-#  - 크롤링 단계 성공/실패/스킵(짧음/네이버 링크 아님) 카운트 표시
+#  [UI/UX 개선]
+#  1) 결과 탭 3개: 요약 / 기사 목록 / 키워드 표
+#  2) 요약 탭:
+#     - Top 키워드 5개 "배지" 요약(한 줄)
+#     - 워드클라우드(좌) + Top20 막대차트(우) 2열 배치
+#     - 다운로드 액션 바(1줄 3버튼)
+#  3) 기사 목록 탭:
+#     - 제목 내 "검색어 하이라이트" 표시(<mark>)
+#     - 간단 필터/정렬 UI:
+#         * 정렬: 최신순/오래된순
+#         * 제목 포함 단어 필터
 #
+#  [안정성(방어코드)]
+#  - API 인증 실패 처리(401/403)
+#  - 네트워크 오류(timeout/connection/request exception)
+#  - API 응답 코드가 200이 아니면 st.error("API 요청 실패")
+#  - 크롤링 실패 시 skip 처리
+#  - 데이터 부족 시 사용자 안내 강화(팁 제공)
+#
+#  [다운로드 정책]
+#  - "이미지 다운로드(.png)" 버튼 1번 클릭으로
+#     워드클라우드 + Top20 PNG 두 파일을 ZIP으로 제공
+#     (브라우저 정책상 가장 안정적)
+#
+#  ------------------------------------------------------------
 #  실행:
 #     streamlit run app_v4.py
 # ============================================================
 #
+
 
 # ============================================================
 # 라이브러리 호출
@@ -20,7 +43,6 @@ import json
 import re
 import pickle
 import html
-import time
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from io import BytesIO
@@ -28,9 +50,6 @@ from urllib.parse import quote
 import zipfile
 
 import requests as rq
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
 import bs4
 import pandas as pd
 import numpy as np
@@ -61,22 +80,26 @@ MASK_BG = {
     "하트": "./resources/background_3.png",
 }
 
-# API/크롤링 timeout 기본값(배포 환경에서 read_timeout이 더 중요)
-API_TIMEOUT = (5, 25)      # (connect_timeout, read_timeout)
-CRAWL_TIMEOUT = (5, 15)    # 크롤링은 너무 길게 끌지 않게
-
 
 # ============================================================
 # 1) 테마 친화 CSS (라이트/다크 공용)
 # ============================================================
 def inject_theme_friendly_css() -> None:
     """
-    라이트/다크 모드 모두 자연스럽게 보이도록
-    - 카드/배지/하이라이트 스타일을 테마 친화적으로 적용
+    Streamlit은 라이트/다크 모드가 바뀌어도 기본 테마 변수를 유지합니다.
+    여기서는 '과한 색상'을 피하고, 배경/테두리/텍스트를 테마에 맞게 자연스럽게 맞춥니다.
+
+    핵심:
+    - 배경/텍스트는 Streamlit 기본을 따르고
+    - 카드/배지 등에만 약한 테두리/그라데이션 느낌 최소 적용
+    - mark(하이라이트)도 다크모드에서 눈부시지 않게 조절
     """
     st.markdown(
         """
         <style>
+        /* 페이지 폭/여백: Streamlit 기본 유지 */
+
+        /* 2줄 타이틀 영역 */
         .nk-title-wrap{
             text-align:center;
             margin: 0.25rem 0 1.0rem 0;
@@ -94,6 +117,7 @@ def inject_theme_friendly_css() -> None:
             margin-top: 0.35rem;
         }
 
+        /* 카드 UI: 테마에 자연스럽게 */
         .nk-card{
             border: 1px solid rgba(128,128,128,0.25);
             border-radius: 14px;
@@ -101,6 +125,7 @@ def inject_theme_friendly_css() -> None:
             margin: 10px 0;
             background: rgba(128,128,128,0.06);
         }
+        /* 다크모드에서 카드 배경이 너무 밝지 않게(약간 더 어둡게) */
         @media (prefers-color-scheme: dark) {
           .nk-card{
             background: rgba(255,255,255,0.04);
@@ -108,6 +133,7 @@ def inject_theme_friendly_css() -> None:
           }
         }
 
+        /* 배지 UI */
         .nk-badge{
             display:inline-block;
             padding:6px 12px;
@@ -116,7 +142,7 @@ def inject_theme_friendly_css() -> None:
             font-size: 0.92rem;
             font-weight: 750;
             border: 1px solid rgba(128,128,128,0.25);
-            background: rgba(99,102,241,0.10);
+            background: rgba(99,102,241,0.10); /* 인디고 계열 아주 연하게 */
         }
         @media (prefers-color-scheme: dark) {
           .nk-badge{
@@ -125,53 +151,24 @@ def inject_theme_friendly_css() -> None:
           }
         }
 
+        /* 제목 하이라이트 <mark> 스타일: 라이트/다크 공용 */
         mark{
             padding: 0.08em 0.18em;
             border-radius: 0.25em;
-            background: rgba(245, 158, 11, 0.35);
+            background: rgba(245, 158, 11, 0.35); /* amber 투명 */
             color: inherit;
         }
         @media (prefers-color-scheme: dark) {
-          mark{ background: rgba(245, 158, 11, 0.28); }
+          mark{
+            background: rgba(245, 158, 11, 0.28);
+          }
         }
 
+        /* 링크가 너무 튀지 않게 */
         .nk-link{
             opacity: 0.92;
             font-weight: 650;
         }
-
-        /* 진단 배지 */
-        .nk-pill{
-            display:inline-block;
-            padding:6px 10px;
-            margin:4px 6px 4px 0;
-            border-radius: 999px;
-            font-size: 0.86rem;
-            font-weight: 750;
-            border: 1px solid rgba(128,128,128,0.25);
-            background: rgba(16,185,129,0.12); /* emerald */
-        }
-        @media (prefers-color-scheme: dark) {
-          .nk-pill{
-            background: rgba(16,185,129,0.18);
-            border: 1px solid rgba(255,255,255,0.18);
-          }
-        }
-
-        .nk-pill-warn{
-            background: rgba(245,158,11,0.12);
-        }
-        @media (prefers-color-scheme: dark) {
-          .nk-pill-warn{ background: rgba(245,158,11,0.18); }
-        }
-
-        .nk-pill-bad{
-            background: rgba(239,68,68,0.12);
-        }
-        @media (prefers-color-scheme: dark) {
-          .nk-pill-bad{ background: rgba(239,68,68,0.18); }
-        }
-
         </style>
         """,
         unsafe_allow_html=True
@@ -192,37 +189,7 @@ def setup_matplotlib_korean_font() -> None:
 
 
 # ============================================================
-# 3) requests 세션 + 재시도(배포 환경 안정화)
-# ============================================================
-@st.cache_resource
-def get_http_session() -> rq.Session:
-    """
-    배포 환경에서 timeout/일시 장애가 종종 발생합니다.
-    - Session 재사용(연결/TLS 재사용)
-    - Retry + Backoff(429/5xx/timeout 가치 있는 오류 자동 복구)
-    """
-    session = rq.Session()
-
-    retry = Retry(
-        total=4,
-        connect=4,
-        read=4,
-        backoff_factor=0.6,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-        respect_retry_after_header=True,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-
-    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; NKVisualizer/1.0)"})
-    return session
-
-
-# ============================================================
-# 4) 리소스 로딩(캐시)
+# 3) 리소스 로딩(캐시)
 # ============================================================
 def load_json(path: str) -> dict:
     """JSON 파일 안전 로드(실패 시 빈 dict)."""
@@ -254,7 +221,7 @@ def load_tokenizer():
 
 
 # ============================================================
-# 5) 텍스트 유틸
+# 4) 텍스트 유틸
 # ============================================================
 def clean_title(raw_title: str) -> str:
     """네이버 뉴스 title의 HTML 제거 + 공백 정리."""
@@ -292,7 +259,7 @@ def normalize_token(t: str) -> str:
 
 
 def build_final_keyword(category: str, user_keyword: str) -> str:
-    """분야 + 사용자 키워드 결합."""
+    """분야 + 사용자 키워드 결합(공백 기반)."""
     category = (category or "").strip()
     user_keyword = re.sub(r"\s+", " ", (user_keyword or "")).strip()
     return f"{category} {user_keyword}".strip()
@@ -323,217 +290,64 @@ def highlight_keyword(text: str, keyword: str) -> str:
 
 
 # ============================================================
-# 6) 진단용 메트릭(초기화/저장)
+# 5) 네이버 API(방어 코드)
 # ============================================================
-def init_api_metrics(total_display: int) -> dict:
-    """API 단계 진단 메트릭 초기화."""
-    page_cnt = max(1, total_display // 100)
-    return {
-        "pages_planned": page_cnt,
-        "pages_attempted": 0,
-        "pages_ok": 0,
-        "pages_fail": 0,
-        "items_total": 0,
-        "http_status_counts": {},     # 예: {200: 3, 429: 1}
-        "error_counts": {},           # 예: {"ReadTimeout":2, "AuthFail":1}
-        "latencies": [],              # 응답시간(초) 리스트
-        "last_error": "",
-    }
-
-
-def init_crawl_metrics() -> dict:
-    """크롤링 단계 진단 메트릭 초기화."""
-    return {
-        "candidate_links": 0,         # n.news.naver 링크 수
-        "attempted": 0,
-        "success": 0,
-        "fail": 0,
-        "skip_short": 0,              # 본문이 너무 짧아 skip
-        "skip_non_naver": 0,          # 네이버 뉴스 링크가 아니라 skip
-        "last_error": "",
-    }
-
-
-def inc_dict(d: dict, k, inc: int = 1):
-    d[k] = d.get(k, 0) + inc
-
-
-def save_results_to_session(
-    final_keyword: str,
-    df_items: pd.DataFrame,
-    df_kw_top50: pd.DataFrame,
-    df_kw_top20: pd.DataFrame,
-    wc_png: bytes,
-    top20_png: bytes,
-    zip_bytes: bytes,
-    api_metrics: dict,
-    crawl_metrics: dict,
-):
-    st.session_state["result_ready"] = True
-    st.session_state["final_keyword"] = final_keyword
-    st.session_state["df_items"] = df_items
-    st.session_state["df_kw_top50"] = df_kw_top50
-    st.session_state["df_kw_top20"] = df_kw_top20
-    st.session_state["wc_png"] = wc_png
-    st.session_state["top20_png"] = top20_png
-    st.session_state["images_zip"] = zip_bytes
-    st.session_state["api_metrics"] = api_metrics
-    st.session_state["crawl_metrics"] = crawl_metrics
-
-
-def clear_results_session():
-    st.session_state["result_ready"] = False
-    for k in [
-        "final_keyword", "df_items", "df_kw_top50", "df_kw_top20",
-        "wc_png", "top20_png", "images_zip", "api_metrics", "crawl_metrics"
-    ]:
-        if k in st.session_state:
-            del st.session_state[k]
-
-
-# ============================================================
-# 7) 네이버 API(방어 + 진단)
-# ============================================================
-def naver_news_api_request(
-    keyword: str,
-    display: int,
-    start: int,
-    client_id: str,
-    client_secret: str,
-    api_metrics: dict,
-) -> list[dict]:
+def naver_news_api_request(keyword: str, display: int, start: int, client_id: str, client_secret: str) -> list[dict]:
     """
     네이버 뉴스 검색 API(1페이지).
-    ✅ 진단 포함:
-    - 페이지 시도/성공/실패
-    - 상태코드 카운트
-    - timeout/exception 카운트
-    - 응답시간 기록
+    - 네트워크 오류 방어
+    - 인증 실패/HTTP 오류 방어
+    - status_code != 200이면 st.error("API 요청 실패")
     """
-    api_metrics["pages_attempted"] += 1
-
     if not client_id.strip() or not client_secret.strip():
-        inc_dict(api_metrics["error_counts"], "MissingKey")
-        api_metrics["last_error"] = "MissingKey"
         st.error("API 인증 정보(Client ID/Secret)가 비어 있습니다.")
         return []
 
-    url = (
-        "https://openapi.naver.com/v1/search/news.json"
-        f"?query={quote(keyword)}&display={display}&start={start}"
-    )
+    url = f"https://openapi.naver.com/v1/search/news.json?query={quote(keyword)}&display={display}&start={start}"
     headers = {
         "X-Naver-Client-Id": client_id.strip(),
         "X-Naver-Client-Secret": client_secret.strip(),
     }
 
-    session = get_http_session()
-
     try:
-        t0 = time.perf_counter()
-        res = session.get(url, headers=headers, timeout=API_TIMEOUT)
-        elapsed = time.perf_counter() - t0
-        api_metrics["latencies"].append(elapsed)
-
-    except rq.exceptions.ConnectTimeout:
-        api_metrics["pages_fail"] += 1
-        inc_dict(api_metrics["error_counts"], "ConnectTimeout")
-        api_metrics["last_error"] = "ConnectTimeout"
-        st.error("네트워크 오류: 서버 연결 시간이 초과되었습니다(ConnectTimeout).")
-        return []
-    except rq.exceptions.ReadTimeout:
-        api_metrics["pages_fail"] += 1
-        inc_dict(api_metrics["error_counts"], "ReadTimeout")
-        api_metrics["last_error"] = "ReadTimeout"
-        st.error("네트워크 오류: 응답 대기 시간이 초과되었습니다(ReadTimeout).")
-        return []
+        res = rq.get(url, headers=headers, timeout=10)
     except rq.exceptions.Timeout:
-        api_metrics["pages_fail"] += 1
-        inc_dict(api_metrics["error_counts"], "Timeout")
-        api_metrics["last_error"] = "Timeout"
         st.error("네트워크 오류: 요청 시간이 초과되었습니다(timeout).")
         return []
     except rq.exceptions.ConnectionError:
-        api_metrics["pages_fail"] += 1
-        inc_dict(api_metrics["error_counts"], "ConnectionError")
-        api_metrics["last_error"] = "ConnectionError"
         st.error("네트워크 오류: 서버에 연결할 수 없습니다(ConnectionError).")
         return []
     except rq.exceptions.RequestException as e:
-        api_metrics["pages_fail"] += 1
-        inc_dict(api_metrics["error_counts"], "RequestException")
-        api_metrics["last_error"] = f"RequestException: {e}"
         st.error(f"네트워크 오류: {e}")
         return []
 
-    inc_dict(api_metrics["http_status_counts"], res.status_code)
-
-    # 요구사항: 200 아니면 "API 요청 실패"
+    # ✅ 요구사항
     if res.status_code != 200:
-        api_metrics["pages_fail"] += 1
         st.error("API 요청 실패")
-
         if res.status_code in (401, 403):
-            inc_dict(api_metrics["error_counts"], "AuthFail")
-            api_metrics["last_error"] = f"AuthFail({res.status_code})"
             st.warning("API 인증 실패(권한/키 오류). Client ID/Secret을 확인하세요.")
-        elif res.status_code == 429:
-            inc_dict(api_metrics["error_counts"], "RateLimit(429)")
-            api_metrics["last_error"] = "RateLimit(429)"
-            st.warning("요청이 너무 많습니다(429). 잠시 후 다시 시도하세요.")
         else:
-            inc_dict(api_metrics["error_counts"], f"HTTP({res.status_code})")
-            api_metrics["last_error"] = f"HTTP({res.status_code})"
-            hint = (res.text or "")[:200].strip()
-            if hint:
-                st.caption(f"응답 일부: {hint}")
             st.warning(f"HTTP 상태코드: {res.status_code}")
-
         return []
 
     try:
         data = res.json()
-        items = data.get("items", []) or []
-        api_metrics["pages_ok"] += 1
-        api_metrics["items_total"] += len(items)
-        return items
+        return data.get("items", []) or []
     except Exception:
-        api_metrics["pages_fail"] += 1
-        inc_dict(api_metrics["error_counts"], "JSONParseFail")
-        api_metrics["last_error"] = "JSONParseFail"
         st.error("API 응답 JSON 파싱 실패")
         return []
 
 
-def fetch_news_items(final_keyword: str, total_display: int, client_id: str, client_secret: str, api_metrics: dict) -> list[dict]:
-    """
-    100단위로 페이지 요청 후 items 합치기.
-    ✅ 배포 안정화:
-    - 일부 페이지 실패해도 계속
-    - 연속 실패 누적되면 조기 중단(앱이 오래 멈춘 듯 보이는 문제 방지)
-    """
+def fetch_news_items(final_keyword: str, total_display: int, client_id: str, client_secret: str) -> list[dict]:
+    """100단위로 페이지 요청 후 items 합치기(일부 실패해도 계속)."""
     items: list[dict] = []
-    page_count = api_metrics["pages_planned"]
-
-    consecutive_fail = 0
-    MAX_CONSEC_FAIL = 2
+    page_count = max(1, total_display // 100)
 
     for i in range(page_count):
         start = 100 * i + 1
-        page_items = naver_news_api_request(
-            final_keyword, 100, start,
-            client_id, client_secret,
-            api_metrics
-        )
-
+        page_items = naver_news_api_request(final_keyword, 100, start, client_id, client_secret)
         if page_items:
             items.extend(page_items)
-            consecutive_fail = 0
-        else:
-            consecutive_fail += 1
-            if consecutive_fail >= MAX_CONSEC_FAIL:
-                st.warning("API 요청이 연속으로 실패하여 추가 페이지 수집을 중단했습니다.")
-                break
 
     return items
 
@@ -551,72 +365,35 @@ def build_items_dataframe(items: list[dict]) -> pd.DataFrame:
 
 
 # ============================================================
-# 8) 크롤링(실패 skip + 진단)
+# 6) 크롤링(실패 skip)
 # ============================================================
-def crawl_naver_news_body(url: str, crawl_metrics: dict) -> str:
-    """
-    네이버 뉴스 본문 크롤링(#dic_area).
-    ✅ 진단 포함:
-    - attempted/success/fail 카운트
-    - 예외 발생해도 앱이 죽지 않게 처리
-    """
-    crawl_metrics["attempted"] += 1
-    session = get_http_session()
-
+def crawl_naver_news_body(url: str) -> str:
+    """네이버 뉴스 본문 크롤링(실패 시 '' 반환)."""
     try:
-        res = session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=CRAWL_TIMEOUT)
+        res = rq.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         if res.status_code != 200:
-            crawl_metrics["fail"] += 1
-            crawl_metrics["last_error"] = f"HTTP({res.status_code})"
             return ""
-
         soup = bs4.BeautifulSoup(res.text, "html.parser")
         tag = soup.select_one("#dic_area")
-        if not tag:
-            crawl_metrics["fail"] += 1
-            crawl_metrics["last_error"] = "NoSelector(#dic_area)"
-            return ""
-
-        crawl_metrics["success"] += 1
-        return tag.get_text(separator=" ", strip=True)
-
-    except rq.exceptions.Timeout:
-        crawl_metrics["fail"] += 1
-        crawl_metrics["last_error"] = "Timeout"
-        return ""
-    except rq.exceptions.RequestException as e:
-        crawl_metrics["fail"] += 1
-        crawl_metrics["last_error"] = f"RequestException: {e}"
-        return ""
-    except Exception as e:
-        crawl_metrics["fail"] += 1
-        crawl_metrics["last_error"] = f"Exception: {e}"
+        return tag.get_text(separator=" ", strip=True) if tag else ""
+    except Exception:
         return ""
 
 
-def collect_corpus_from_items(items: list[dict], crawl_metrics: dict) -> list[str]:
-    """
-    네이버 뉴스 링크만 본문 수집.
-    - 실패/짧은 본문 skip
-    - 진단용 카운트 집계
-    """
+def collect_corpus_from_items(items: list[dict]) -> list[str]:
+    """네이버 뉴스 링크만 본문 수집. 실패/짧은 본문 skip."""
     docs = []
     for it in items:
         link = it.get("link", "")
-
         if "n.news.naver" not in link:
-            crawl_metrics["skip_non_naver"] += 1
             continue
 
-        crawl_metrics["candidate_links"] += 1
-
-        body = crawl_naver_news_body(link, crawl_metrics)
+        body = crawl_naver_news_body(link)
         if not body:
             continue
 
         cleaned = clean_text_keep_korean(body)
         if len(cleaned) < 100:
-            crawl_metrics["skip_short"] += 1
             continue
 
         docs.append(cleaned)
@@ -625,7 +402,7 @@ def collect_corpus_from_items(items: list[dict], crawl_metrics: dict) -> list[st
 
 
 # ============================================================
-# 9) 분석(soynlp 명사 set + TF-IDF)
+# 7) 분석(soynlp 명사 set + TF-IDF)
 # ============================================================
 @st.cache_data(show_spinner=False)
 def build_noun_set(docs_clean: list[str]) -> set[str]:
@@ -737,7 +514,7 @@ def build_keyword_tables(score_dict: dict[str, float]) -> tuple[pd.DataFrame, pd
 
 
 # ============================================================
-# 10) 시각화(PNG bytes)
+# 8) 시각화(이미지 bytes)
 # ============================================================
 def fig_to_png_bytes(fig) -> bytes:
     """matplotlib figure -> PNG bytes."""
@@ -803,10 +580,13 @@ def make_images_zip_bytes(wordcloud_png: bytes, top20_png: bytes, base_name: str
 
 
 # ============================================================
-# 11) UI 렌더링
+# 9) UI 렌더링
 # ============================================================
 def render_header_with_lottie_and_center_title():
-    """Lottie 좌측 + 2줄 가운데 타이틀"""
+    """
+    ✅ Lottie는 기존처럼 좌측에 배치
+    ✅ 타이틀은 2줄로 가운데 정렬
+    """
     col1, col2 = st.columns([1, 2.2])
 
     with col1:
@@ -815,6 +595,7 @@ def render_header_with_lottie_and_center_title():
             st_lottie(lottie, speed=1, loop=True, width=200, height=200)
 
     with col2:
+        # 타이틀은 HTML로 가운데 정렬 + 2줄 표현
         st.markdown(
             """
             <div class="nk-title-wrap">
@@ -843,7 +624,7 @@ def render_sidebar_api_settings():
 
 def render_sidebar_options():
     """
-    옵션 체크박스(요구사항):
+    ✅ 옵션 체크박스
     - 1줄: 기사 목록 보기, 링크 제공, 기사 목록 다운로드(.csv)
     - 2줄: 키워드 표 보기, 키워드 표 다운로드(.csv), 이미지 다운로드(.png)
     """
@@ -875,7 +656,10 @@ def render_sidebar_options():
 
 
 def render_sidebar_stopwords() -> set[str]:
-    """불용어 영역(파일 + 추가 입력)."""
+    """
+    ✅ 불용어 영역
+    - 파일 불용어 + 추가 입력 불용어를 합쳐서 반환
+    """
     st.sidebar.header("불용어(Stopwords) :")
     base_stop = load_stopwords_file(STOPWORDS_PATH)
     extra_stop = st.sidebar.text_area("추가 불용어(줄바꿈으로 입력)", value="", height=120)
@@ -885,7 +669,11 @@ def render_sidebar_stopwords() -> set[str]:
 
 
 def render_search_form():
-    """검색 폼(UI 카드)."""
+    """
+    메인 입력 폼(UI 카드)
+    - 분야/키워드/분량 3열
+    - 백마스크 라디오
+    """
     with st.container(border=True):
         st.subheader("검색 조건")
 
@@ -916,13 +704,42 @@ def render_search_form():
 
 
 # ============================================================
-# 12) 파이프라인 실행(상태박스+진행바)
+# 10) 결과 세션 저장/초기화
+# ============================================================
+def save_results_to_session(
+    final_keyword: str,
+    df_items: pd.DataFrame,
+    df_kw_top50: pd.DataFrame,
+    df_kw_top20: pd.DataFrame,
+    wc_png: bytes,
+    top20_png: bytes,
+    zip_bytes: bytes,
+):
+    st.session_state["result_ready"] = True
+    st.session_state["final_keyword"] = final_keyword
+    st.session_state["df_items"] = df_items
+    st.session_state["df_kw_top50"] = df_kw_top50
+    st.session_state["df_kw_top20"] = df_kw_top20
+    st.session_state["wc_png"] = wc_png
+    st.session_state["top20_png"] = top20_png
+    st.session_state["images_zip"] = zip_bytes
+
+
+def clear_results_session():
+    st.session_state["result_ready"] = False
+    for k in ["final_keyword", "df_items", "df_kw_top50", "df_kw_top20", "wc_png", "top20_png", "images_zip"]:
+        if k in st.session_state:
+            del st.session_state[k]
+
+
+# ============================================================
+# 11) 파이프라인 실행(상태박스+진행바)
 # ============================================================
 def run_pipeline(form: dict, stopwords: set[str], status_box, progress_bar):
     """
-    파이프라인:
-    1) API 수집(+진단)
-    2) 크롤링(+진단)
+    파이프라인 실행:
+    1) API 수집
+    2) 크롤링
     3) 분석
     4) 시각화
     """
@@ -938,35 +755,14 @@ def run_pipeline(form: dict, stopwords: set[str], status_box, progress_bar):
 
     final_keyword = build_final_keyword(form["category"], form["user_keyword"])
 
-    # ✅ 진단 메트릭 초기화
-    api_metrics = init_api_metrics(form["display"])
-    crawl_metrics = init_crawl_metrics()
-
     # 1) API 수집
     status_box.info(f"1/4 뉴스 목록 수집 중... (검색어: {final_keyword})")
     progress_bar.progress(0.2)
+    items = fetch_news_items(final_keyword, form["display"], client_id, client_secret)
 
-    items = fetch_news_items(final_keyword, form["display"], client_id, client_secret, api_metrics)
-
-    # API 단계가 실패하면(=items가 없다면) 진단 정보를 저장해두고 종료
     if not items:
         status_box.error("뉴스 목록을 가져오지 못했습니다.")
         st.info("가능한 원인: (1) 인증 실패 (2) 네트워크 오류 (3) 검색 결과 없음")
-
-        # ✅ 결과 세션에도 진단 정보만 저장(요약 탭에서 확인 가능하게)
-        df_items = pd.DataFrame(columns=["title", "pubDate", "link"])
-        save_results_to_session(
-            final_keyword=final_keyword,
-            df_items=df_items,
-            df_kw_top50=pd.DataFrame(columns=["keyword", "score"]),
-            df_kw_top20=pd.DataFrame(columns=["keyword", "score"]),
-            wc_png=b"",
-            top20_png=b"",
-            zip_bytes=b"",
-            api_metrics=api_metrics,
-            crawl_metrics=crawl_metrics,
-        )
-        st.session_state["result_ready"] = True
         return
 
     df_items = build_items_dataframe(items)
@@ -974,8 +770,7 @@ def run_pipeline(form: dict, stopwords: set[str], status_box, progress_bar):
     # 2) 크롤링
     status_box.info("2/4 뉴스 본문 크롤링 중...")
     progress_bar.progress(0.45)
-
-    docs_clean = collect_corpus_from_items(items, crawl_metrics)
+    docs_clean = collect_corpus_from_items(items)
 
     if len(docs_clean) < 5:
         status_box.warning("본문 데이터가 부족하여 분석이 어렵습니다.")
@@ -983,52 +778,24 @@ def run_pipeline(form: dict, stopwords: set[str], status_box, progress_bar):
             "개선 팁:\n"
             "- 분량을 300~500으로 늘려보세요.\n"
             "- 키워드를 더 일반적으로 바꿔보세요.\n"
-            "- 기사 목록에서 네이버 뉴스 링크가 충분한지 확인해보세요.\n"
-            "- (배포 환경) 크롤링 성공률이 낮다면 차단 가능성이 큽니다."
+            "- 기사 목록에서 네이버 뉴스 링크가 충분한지 확인해보세요."
         )
-
-        save_results_to_session(
-            final_keyword=final_keyword,
-            df_items=df_items,
-            df_kw_top50=pd.DataFrame(columns=["keyword", "score"]),
-            df_kw_top20=pd.DataFrame(columns=["keyword", "score"]),
-            wc_png=b"",
-            top20_png=b"",
-            zip_bytes=b"",
-            api_metrics=api_metrics,
-            crawl_metrics=crawl_metrics,
-        )
-        st.session_state["result_ready"] = True
         return
 
     # 3) 분석
     status_box.info("3/4 키워드 분석 중(명사 필터 + TF-IDF)...")
     progress_bar.progress(0.7)
-
     docs_tokens = tokenize_and_filter_docs(docs_clean, stopwords)
 
     score_dict = compute_tfidf_scores(docs_tokens, top_k=80)
     if not score_dict:
         status_box.warning("키워드 점수를 계산할 수 없습니다(데이터/필터 조건 부족).")
         st.info("개선 팁: 분량을 늘리거나 불용어를 과도하게 추가하지 않았는지 확인하세요.")
-
-        save_results_to_session(
-            final_keyword=final_keyword,
-            df_items=df_items,
-            df_kw_top50=pd.DataFrame(columns=["keyword", "score"]),
-            df_kw_top20=pd.DataFrame(columns=["keyword", "score"]),
-            wc_png=b"",
-            top20_png=b"",
-            zip_bytes=b"",
-            api_metrics=api_metrics,
-            crawl_metrics=crawl_metrics,
-        )
-        st.session_state["result_ready"] = True
         return
 
     _, df_kw_top50, df_kw_top20 = build_keyword_tables(score_dict)
 
-    # 4) 시각화 생성
+    # 4) 시각화 생성 (PNG bytes)
     status_box.info("4/4 시각화 생성 중...")
     progress_bar.progress(0.9)
 
@@ -1037,19 +804,6 @@ def run_pipeline(form: dict, stopwords: set[str], status_box, progress_bar):
 
     if not wc_png or not top20_png:
         status_box.error("시각화 생성에 실패했습니다(데이터 부족/렌더링 오류).")
-
-        save_results_to_session(
-            final_keyword=final_keyword,
-            df_items=df_items,
-            df_kw_top50=df_kw_top50,
-            df_kw_top20=df_kw_top20,
-            wc_png=b"",
-            top20_png=b"",
-            zip_bytes=b"",
-            api_metrics=api_metrics,
-            crawl_metrics=crawl_metrics,
-        )
-        st.session_state["result_ready"] = True
         return
 
     base = safe_filename(final_keyword)
@@ -1067,17 +821,16 @@ def run_pipeline(form: dict, stopwords: set[str], status_box, progress_bar):
         wc_png=wc_png,
         top20_png=top20_png,
         zip_bytes=zip_bytes,
-        api_metrics=api_metrics,
-        crawl_metrics=crawl_metrics,
     )
 
 
 # ============================================================
-# 13) 결과 탭 UI
+# 12) 결과 탭 UI
 # ============================================================
 def render_top5_badges(df_kw_top50: pd.DataFrame) -> None:
     """요약 탭에 Top5 키워드를 배지로 렌더링."""
     top5 = df_kw_top50.head(5)["keyword"].tolist()
+
     badges = "".join([f'<span class="nk-badge">#{kw}</span>' for kw in top5])
 
     st.markdown(
@@ -1091,147 +844,23 @@ def render_top5_badges(df_kw_top50: pd.DataFrame) -> None:
     )
 
 
-def render_diagnostics_panel(api_metrics: dict, crawl_metrics: dict):
-    """
-    ✅ 배포 진단용 패널
-    - API: 페이지 성공률, 상태코드 분포, timeout/에러, 평균 응답시간
-    - Crawl: 후보 링크/시도/성공/실패/스킵 카운트
-    """
-    st.markdown('<div class="nk-card">', unsafe_allow_html=True)
-    st.markdown("### 배포 환경 진단(원인 빠른 판별)")
-
-    # ---------- API 요약 ----------
-    pages_planned = api_metrics.get("pages_planned", 0)
-    pages_attempted = api_metrics.get("pages_attempted", 0)
-    pages_ok = api_metrics.get("pages_ok", 0)
-    pages_fail = api_metrics.get("pages_fail", 0)
-    items_total = api_metrics.get("items_total", 0)
-
-    lat = api_metrics.get("latencies", [])
-    avg_latency = float(np.mean(lat)) if lat else 0.0
-    p95_latency = float(np.percentile(lat, 95)) if len(lat) >= 3 else (max(lat) if lat else 0.0)
-
-    http_counts = api_metrics.get("http_status_counts", {})
-    err_counts = api_metrics.get("error_counts", {})
-    last_err = api_metrics.get("last_error", "")
-
-    # 성공률
-    api_success_rate = (pages_ok / pages_attempted * 100) if pages_attempted else 0.0
-
-    # 상태 판단(대충 3단계)
-    # - ok: 성공률 70% 이상
-    # - warn: 30~70%
-    # - bad: 30% 미만
-    if api_success_rate >= 70:
-        api_pill_class = "nk-pill"
-        api_level = "양호"
-    elif api_success_rate >= 30:
-        api_pill_class = "nk-pill nk-pill-warn"
-        api_level = "주의"
-    else:
-        api_pill_class = "nk-pill nk-pill-bad"
-        api_level = "위험"
-
-    st.markdown("**1) API 단계(네이버 뉴스 검색 API)**")
-    st.markdown(
-        f"""
-        <span class="{api_pill_class}">성공률 {api_success_rate:.0f}% ({api_level})</span>
-        <span class="nk-pill">페이지 OK {pages_ok}</span>
-        <span class="nk-pill nk-pill-warn">페이지 FAIL {pages_fail}</span>
-        <span class="nk-pill">items {items_total}</span>
-        <span class="nk-pill">평균응답 {avg_latency:.2f}s</span>
-        <span class="nk-pill">p95 {p95_latency:.2f}s</span>
-        """,
-        unsafe_allow_html=True
-    )
-    st.caption(f"계획 페이지: {pages_planned} / 시도 페이지: {pages_attempted} / 마지막 에러: {last_err or '-'}")
-
-    # 상태코드/에러 테이블(간단)
-    colA, colB = st.columns(2)
-    with colA:
-        if http_counts:
-            df_http = pd.DataFrame(sorted(http_counts.items()), columns=["status_code", "count"])
-            st.dataframe(df_http, use_container_width=True, height=150)
-        else:
-            st.info("상태코드 기록이 없습니다.")
-    with colB:
-        if err_counts:
-            df_err = pd.DataFrame(sorted(err_counts.items(), key=lambda x: x[1], reverse=True), columns=["error", "count"])
-            st.dataframe(df_err, use_container_width=True, height=150)
-        else:
-            st.info("에러 기록이 없습니다.")
-
-    st.divider()
-
-    # ---------- Crawl 요약 ----------
-    st.markdown("**2) 크롤링 단계(네이버 뉴스 본문 수집)**")
-    candidate = crawl_metrics.get("candidate_links", 0)
-    attempted = crawl_metrics.get("attempted", 0)
-    success = crawl_metrics.get("success", 0)
-    fail = crawl_metrics.get("fail", 0)
-    skip_short = crawl_metrics.get("skip_short", 0)
-    skip_non = crawl_metrics.get("skip_non_naver", 0)
-    last_crawl_err = crawl_metrics.get("last_error", "")
-
-    crawl_success_rate = (success / attempted * 100) if attempted else 0.0
-
-    if crawl_success_rate >= 70:
-        crawl_pill_class = "nk-pill"
-        crawl_level = "양호"
-    elif crawl_success_rate >= 30:
-        crawl_pill_class = "nk-pill nk-pill-warn"
-        crawl_level = "주의"
-    else:
-        crawl_pill_class = "nk-pill nk-pill-bad"
-        crawl_level = "위험"
-
-    st.markdown(
-        f"""
-        <span class="{crawl_pill_class}">성공률 {crawl_success_rate:.0f}% ({crawl_level})</span>
-        <span class="nk-pill">후보링크 {candidate}</span>
-        <span class="nk-pill">시도 {attempted}</span>
-        <span class="nk-pill">성공 {success}</span>
-        <span class="nk-pill nk-pill-warn">실패 {fail}</span>
-        <span class="nk-pill nk-pill-warn">짧아서 스킵 {skip_short}</span>
-        <span class="nk-pill">비네이버 스킵 {skip_non}</span>
-        """,
-        unsafe_allow_html=True
-    )
-    st.caption(f"마지막 크롤링 에러: {last_crawl_err or '-'}")
-
-    # 원인 힌트
-    st.markdown("**원인 힌트(빠른 판단)**")
-    hints = []
-    if api_success_rate < 30:
-        hints.append("- API 성공률이 낮습니다 → 배포 네트워크/레이트리밋/인증 문제 가능성이 큽니다.")
-    if api_success_rate >= 70 and crawl_success_rate < 30:
-        hints.append("- API는 정상인데 크롤링 성공률이 낮습니다 → 크롤링 차단(봇 차단) 또는 본문 선택자 변화 가능성이 큽니다.")
-    if candidate == 0:
-        hints.append("- 네이버 뉴스 링크(n.news.naver)가 거의 없습니다 → 검색 결과 링크가 다른 도메인 위주일 수 있습니다.")
-    if not hints:
-        hints.append("- 큰 이상 징후가 없습니다. 분량을 늘리거나 키워드를 조정해 보세요.")
-    st.markdown("\n".join(hints))
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
 def render_results_tabs(options: dict, user_keyword: str) -> None:
-    """탭 기반 결과 UI: 요약 / 기사 목록 / 키워드 표"""
+    """
+    탭 기반 결과 UI:
+    - 요약 / 기사 목록 / 키워드 표
+    """
     if not st.session_state.get("result_ready", False):
         st.info("검색 실행 후 결과가 여기에 표시됩니다.")
         return
 
-    final_keyword = st.session_state.get("final_keyword", "")
-    df_items: pd.DataFrame = st.session_state.get("df_items", pd.DataFrame())
-    df_kw_top50: pd.DataFrame = st.session_state.get("df_kw_top50", pd.DataFrame())
-    df_kw_top20: pd.DataFrame = st.session_state.get("df_kw_top20", pd.DataFrame())
+    final_keyword = st.session_state["final_keyword"]
+    df_items: pd.DataFrame = st.session_state["df_items"]
+    df_kw_top50: pd.DataFrame = st.session_state["df_kw_top50"]
+    df_kw_top20: pd.DataFrame = st.session_state["df_kw_top20"]
 
-    wc_png: bytes = st.session_state.get("wc_png", b"")
-    top20_png: bytes = st.session_state.get("top20_png", b"")
-    images_zip: bytes = st.session_state.get("images_zip", b"")
-
-    api_metrics: dict = st.session_state.get("api_metrics", {})
-    crawl_metrics: dict = st.session_state.get("crawl_metrics", {})
+    wc_png: bytes = st.session_state["wc_png"]
+    top20_png: bytes = st.session_state["top20_png"]
+    images_zip: bytes = st.session_state["images_zip"]
 
     tab_summary, tab_articles, tab_keywords = st.tabs(["요약", "기사 목록", "키워드 표"])
 
@@ -1241,25 +870,16 @@ def render_results_tabs(options: dict, user_keyword: str) -> None:
     with tab_summary:
         st.subheader(f"분석 요약: {final_keyword}")
 
-        # ✅ 진단 패널(항상 표시)
-        if api_metrics or crawl_metrics:
-            render_diagnostics_panel(api_metrics, crawl_metrics)
-
-        # 키워드가 없을 수도 있으니 방어
         if not df_kw_top50.empty:
             render_top5_badges(df_kw_top50)
 
-        # 시각화는 생성된 경우만
-        if wc_png and top20_png:
-            left, right = st.columns(2)
-            with left:
-                st.caption("워드클라우드")
-                st.image(wc_png, use_container_width=True)
-            with right:
-                st.caption("Top20 막대차트")
-                st.image(top20_png, use_container_width=True)
-        else:
-            st.info("시각화 결과가 없습니다. (API/크롤링/분석 단계에서 실패했을 수 있습니다)")
+        left, right = st.columns(2)
+        with left:
+            st.caption("워드클라우드")
+            st.image(wc_png, use_container_width=True)
+        with right:
+            st.caption("Top20 막대차트")
+            st.image(top20_png, use_container_width=True)
 
         # 다운로드 액션바(1줄 3버튼)
         with st.container(border=True):
@@ -1269,7 +889,7 @@ def render_results_tabs(options: dict, user_keyword: str) -> None:
             can_keywords = not df_kw_top50.empty
             can_images = bool(images_zip)
 
-            base = safe_filename(final_keyword or "result")
+            base = safe_filename(final_keyword)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
             b1, b2, b3 = st.columns(3)
@@ -1332,7 +952,7 @@ def render_results_tabs(options: dict, user_keyword: str) -> None:
             st.info("사이드바에서 '기사 목록 보기'를 켜면 표시됩니다.")
             return
 
-        highlight_key = user_keyword.strip()
+        highlight_key = user_keyword.strip()  # 사용자가 입력한 키워드를 하이라이트 대상으로 사용
 
         MAX_SHOW = 60
         df_show = df_view.head(MAX_SHOW)
@@ -1361,10 +981,7 @@ def render_results_tabs(options: dict, user_keyword: str) -> None:
             )
 
             if options["show_links"] and link:
-                st.markdown(
-                    f'- <a class="nk-link" href="{link}" target="_blank">🔗 기사 바로가기</a>',
-                    unsafe_allow_html=True
-                )
+                st.markdown(f'- <a class="nk-link" href="{link}" target="_blank">🔗 기사 바로가기</a>', unsafe_allow_html=True)
 
         if len(df_view) > MAX_SHOW:
             st.info(f"기사 목록이 많아 상위 {MAX_SHOW}개만 표시했습니다. (필터를 더 걸어보세요)")
@@ -1386,34 +1003,45 @@ def render_results_tabs(options: dict, user_keyword: str) -> None:
 
 
 # ============================================================
-# 14) 앱 실행(메인)
+# 13) 앱 실행(메인)
 # ============================================================
 def run_app():
+    # 페이지 설정
     st.set_page_config(page_title="뉴스 키워드 어플리케이션", layout="wide")
 
+    # 테마 친화 CSS 주입 (라이트/다크 자연스러운 색감)
     inject_theme_friendly_css()
+
+    # matplotlib 한글 폰트 설정
     setup_matplotlib_korean_font()
 
+    # 헤더(Lottie + 2줄 가운데 타이틀)
     render_header_with_lottie_and_center_title()
 
+    # 사이드바 API 설정
     render_sidebar_api_settings()
 
-    # ✅ 사이드바 순서: 옵션 -> 불용어
+    # ✅ 사이드바 위치 변경: 옵션 -> 불용어
     options = render_sidebar_options()
     stopwords = render_sidebar_stopwords()
 
+    # 메인 입력 폼
     form = render_search_form()
 
+    # 상태 UI: 한 개만 업데이트되도록 empty + progress 사용
     status_box = st.empty()
     progress_bar = st.progress(0)
 
+    # 세션 초기화
     st.session_state.setdefault("result_ready", False)
 
+    # 검색 실행 시: 이전 결과 제거 후 파이프라인 실행
     if form["submitted"]:
         clear_results_session()
         progress_bar.progress(0)
         run_pipeline(form, stopwords, status_box, progress_bar)
 
+    # 결과 탭 렌더링 (user_keyword 전달: 하이라이트 용)
     render_results_tabs(options, user_keyword=form["user_keyword"])
 
 
