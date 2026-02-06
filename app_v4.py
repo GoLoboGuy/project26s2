@@ -46,6 +46,9 @@ from streamlit_lottie import st_lottie
 from sklearn.feature_extraction.text import TfidfVectorizer
 from soynlp.noun import LRNounExtractor_v2
 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 
 # ============================================================
 # 0) 전역 설정(경로/파일)
@@ -65,6 +68,43 @@ MASK_BG = {
 # 크롤링 판단을 위한 임계값
 MIN_BODY_LEN = 100  # clean_text_keep_korean 이후 최소 길이
 CRAWL_TIMEOUT = 10  # requests timeout(초)
+
+# ============================================================
+# (추가) requests 세션 + 재시도(백오프) 설정
+# ============================================================
+@st.cache_resource
+def get_http_session() -> rq.Session:
+    """
+    배포 환경에서 timeout/일시 장애가 자주 발생하므로
+    - 연결 재사용(Session)
+    - 자동 재시도(Retry + Backoff)
+    를 적용한 세션을 만듭니다.
+    """
+    session = rq.Session()
+
+    retry = Retry(
+        total=4,                 # 총 재시도 횟수(원 요청 포함 X, 라이브러리 내부 동작 기준)
+        connect=4,
+        read=4,
+        backoff_factor=0.6,      # 0.6, 1.2, 2.4, 4.8 ... 식으로 점점 기다림
+        status_forcelist=[429, 500, 502, 503, 504],  # 이런 코드면 재시도 가치가 큼
+        allowed_methods=["GET"], # GET만 재시도
+        raise_on_status=False,
+        respect_retry_after_header=True,  # 429일 때 Retry-After 있으면 존중
+    )
+
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=50,
+        pool_maxsize=50,
+    )
+
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    # 기본 헤더(UA는 크게 중요하지 않지만, 일부 환경에서 안정성에 도움)
+    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; NKVisualizer/1.0)"})
+    return session
 
 
 # ============================================================
@@ -277,33 +317,63 @@ def highlight_keyword(text: str, keyword: str) -> str:
 # 5) 네이버 API(방어 코드)
 # ============================================================
 def naver_news_api_request(keyword: str, display: int, start: int, client_id: str, client_secret: str) -> list[dict]:
+    """
+    네이버 뉴스 검색 API(1페이지).
+    ✅ 개선:
+    - Session + Retry(백오프)
+    - timeout을 (connect_timeout, read_timeout) 튜플로 분리
+    - 실패 원인을 UI에 더 명확히 출력
+    """
     if not client_id.strip() or not client_secret.strip():
         st.error("API 인증 정보(Client ID/Secret)가 비어 있습니다.")
         return []
 
-    url = f"https://openapi.naver.com/v1/search/news.json?query={quote(keyword)}&display={display}&start={start}"
+    url = (
+        "https://openapi.naver.com/v1/search/news.json"
+        f"?query={quote(keyword)}&display={display}&start={start}"
+    )
     headers = {
         "X-Naver-Client-Id": client_id.strip(),
         "X-Naver-Client-Secret": client_secret.strip(),
     }
 
+    session = get_http_session()
+
+    # ✅ timeout을 분리: (연결 시도 제한, 응답 읽기 제한)
+    # 배포 환경에선 connect는 빠른데 read가 느린 경우가 많아서 분리하는 게 유리합니다.
+    timeout = (5, 20)  # 필요하면 (7, 30)까지 올려도 됨
+
     try:
-        res = rq.get(url, headers=headers, timeout=10)
+        res = session.get(url, headers=headers, timeout=timeout)
+
+    except rq.exceptions.ConnectTimeout:
+        st.error("네트워크 오류: 서버 연결 시간이 초과되었습니다(ConnectTimeout).")
+        return []
+    except rq.exceptions.ReadTimeout:
+        st.error("네트워크 오류: 응답 대기 시간이 초과되었습니다(ReadTimeout).")
+        return []
     except rq.exceptions.Timeout:
         st.error("네트워크 오류: 요청 시간이 초과되었습니다(timeout).")
         return []
-    except rq.exceptions.ConnectionError:
-        st.error("네트워크 오류: 서버에 연결할 수 없습니다(ConnectionError).")
+    except rq.exceptions.ConnectionError as e:
+        st.error(f"네트워크 오류: 서버에 연결할 수 없습니다(ConnectionError). {e}")
         return []
     except rq.exceptions.RequestException as e:
         st.error(f"네트워크 오류: {e}")
         return []
 
+    # ✅ 요구사항: 200 아니면 API 요청 실패
     if res.status_code != 200:
         st.error("API 요청 실패")
         if res.status_code in (401, 403):
             st.warning("API 인증 실패(권한/키 오류). Client ID/Secret을 확인하세요.")
+        elif res.status_code == 429:
+            st.warning("요청이 너무 많습니다(429). 잠시 후 다시 시도하세요.")
         else:
+            # 서버가 준 에러 바디도 힌트가 될 수 있어 일부만 출력
+            body_hint = (res.text or "")[:200].strip()
+            if body_hint:
+                st.caption(f"응답 일부: {body_hint}")
             st.warning(f"HTTP 상태코드: {res.status_code}")
         return []
 
@@ -316,14 +386,31 @@ def naver_news_api_request(keyword: str, display: int, start: int, client_id: st
 
 
 def fetch_news_items(final_keyword: str, total_display: int, client_id: str, client_secret: str) -> list[dict]:
+    """
+    100단위로 페이지 요청 후 items 합치기.
+    ✅ 개선:
+    - 일부 페이지 실패해도 계속
+    - 실패가 연속으로 일정 횟수 누적되면 조기 중단(배포 환경 보호)
+    """
     items: list[dict] = []
     page_count = max(1, total_display // 100)
+
+    consecutive_fail = 0
+    MAX_CONSEC_FAIL = 2  # 연속 실패 2번이면 멈춤(너무 오래 끌지 않기)
 
     for i in range(page_count):
         start = 100 * i + 1
         page_items = naver_news_api_request(final_keyword, 100, start, client_id, client_secret)
+
         if page_items:
             items.extend(page_items)
+            consecutive_fail = 0
+        else:
+            consecutive_fail += 1
+            # 연속 실패 시 너무 오래 기다리게 하지 않고 종료
+            if consecutive_fail >= MAX_CONSEC_FAIL:
+                st.warning("API 요청이 연속으로 실패하여 추가 페이지 수집을 중단했습니다.")
+                break
 
     return items
 
@@ -1158,6 +1245,7 @@ def run_app():
             del st.session_state["crawl_stats_preview"]
 
         progress_bar.progress(0)
+        # status_box.info(f"API 수집 결과: items={len(items)} (요청 분량={form['display']})")
         run_pipeline(form, stopwords, status_box, progress_bar)
 
     render_results_tabs(options, user_keyword=form["user_keyword"])
